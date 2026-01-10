@@ -4,10 +4,10 @@
 #
 # 用法：
 #   # 小规模 sanity check（FloorPlan1-20 + GarbageCan）
-#   xvfb-run -a python -u test.py --smalltest --envs 1 2 4 8 --steps 2000 --warmup 100
+#   xvfb-run -a python -u test.py --smalltest --envs 1 2 4 8 --steps 200
 #
 #   # 论文训练设置（TRAIN_SCENES + TARGETS）
-#   xvfb-run -a python -u test.py --envs 1 2 4 8 --steps 2000 --warmup 100
+#   xvfb-run -a python -u test.py --envs 1 2 4 8 --steps 2000
 #
 # 输出：
 #   logs_fps/fps_env_sweep.csv
@@ -21,6 +21,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 
 from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv
+from typing import Callable, Optional, Dict, List
 
 from configs import CFG
 from envs.thor_objnav_env import ThorObjNavEnv
@@ -39,7 +40,7 @@ def _full_paper_splits():
     return TRAIN_SCENES, TARGETS
 
 
-def make_env(rank: int, seed: int, scenes, targets_by_room, backbone_device: str, w2v_path: str | None, debug: bool):
+def make_env(rank: int, seed: int, scenes, targets_by_room, backbone_device: str, w2v_path: str | None, debug: bool, headless: bool) -> Callable[[], ThorObjNavEnv]:
     """
     返回一个可调用对象，用于 SubprocVecEnv/DummyVecEnv 创建 env。
     重要：每个子进程必须独立创建 Controller + 模型实例。
@@ -61,6 +62,7 @@ def make_env(rank: int, seed: int, scenes, targets_by_room, backbone_device: str
             omt=omt,
             device=device,
             debug=debug,
+            headless=headless,
         )
         env.reset(seed=seed + rank)
         return env
@@ -68,26 +70,19 @@ def make_env(rank: int, seed: int, scenes, targets_by_room, backbone_device: str
     return _init
 
 
-def build_vec_env(n_envs: int, seed: int, scenes, targets_by_room, backbone_device: str, w2v_path: str | None, debug: bool):
-    fns = [make_env(i, seed, scenes, targets_by_room, backbone_device, w2v_path, debug) for i in range(n_envs)]
+def build_vec_env(n_envs: int, seed: int, scenes, targets_by_room, backbone_device: str, w2v_path: str | None, debug: bool, headless: bool):
+    fns = [make_env(i, seed, scenes, targets_by_room, backbone_device, w2v_path, debug, headless) for i in range(n_envs)]
     if n_envs <= 1:
         return DummyVecEnv([fns[0]])
     # spawn 更稳，避免 fork 复制 CUDA/Controller 状态
     return SubprocVecEnv(fns, start_method="spawn")
 
 
-def run_fps_once(n_envs: int, *, seed: int, scenes, targets_by_room, backbone_device: str, w2v_path: str | None,
-                 warmup: int, steps: int, debug: bool):
-    env = build_vec_env(n_envs, seed, scenes, targets_by_room, backbone_device, w2v_path, debug)
+def run_fps_once(n_envs: int, *, seed: int, scenes, targets_by_room, backbone_device: str, w2v_path: str | None, steps: int, debug: bool, headless: bool):
+    env = build_vec_env(n_envs, seed, scenes, targets_by_room, backbone_device, w2v_path, debug, headless)
 
     # reset
     env.reset()
-
-    # warmup（不计时，让加载/缓存稳定）
-    for _ in range(max(0, warmup)):
-        actions = np.array([env.action_space.sample() for _ in range(n_envs)])
-        env.step(actions)
-
     # timed
     t0 = time.perf_counter()
     total_transitions = 0
@@ -108,14 +103,14 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--smalltest", action="store_true",
                         help="True: FloorPlan1-20(Kitchen) + GarbageCan; False: 论文设置（scene_split TRAIN_SCENES+TARGETS）")
-    parser.add_argument("--envs", type=int, nargs="+", default=[1, 2, 4, 8], help="要测试的 n_envs 列表")
+    parser.add_argument("--envs", type=int, nargs="+", default=[1, 4, 8, 16], help="要测试的 n_envs 列表")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--steps", type=int, default=2000, help="计时阶段循环次数（每次 step 走 n_envs 个 transition）")
-    parser.add_argument("--warmup", type=int, default=100)
     parser.add_argument("--device", type=str, default="cpu", choices=["cpu", "cuda"], help="resnet/osm/omt 的 device")
     parser.add_argument("--w2v-path", type=str, default=None, help="本地 word2vec 文件路径（.bin/.txt/.kv），离线服务器建议提供")
     parser.add_argument("--out-dir", type=str, default="logs_fps")
     parser.add_argument("--debug", action="store_true")
+    parser.add_argument("--headless", action="store_true", help="Use AI2-THOR headless mode (CloudRendering).")
     args = parser.parse_args()
 
     # config (smalltest vs paper)
@@ -135,7 +130,7 @@ def main():
 
     results = []
     print(f"[MODE] {mode}", flush=True)
-    print(f"[CFG] device={args.device} warmup={args.warmup} steps={args.steps} envs={args.envs}", flush=True)
+    print(f"[CFG] device={args.device} headless={args.headless} steps={args.steps} envs={args.envs}", flush=True)
 
     for n_envs in args.envs:
         try:
@@ -146,9 +141,9 @@ def main():
                 targets_by_room=targets_by_room,
                 backbone_device=args.device,
                 w2v_path=args.w2v_path,
-                warmup=args.warmup,
                 steps=args.steps,
                 debug=args.debug,
+                headless=args.headless,
             )
             results.append((n_envs, fps, wall))
             print(f"n_envs={n_envs:<2d}  FPS={fps:8.2f}  wall={wall:7.2f}s", flush=True)
@@ -161,9 +156,9 @@ def main():
     import csv
     with open(csv_path, "w", newline="") as f:
         w = csv.writer(f)
-        w.writerow(["mode", "n_envs", "fps", "wall_s", "warmup_steps", "timed_steps", "device"])
+        w.writerow(["mode", "n_envs", "fps", "wall_s", "timed_steps", "device"])
         for n_envs, fps, wall in results:
-            w.writerow([mode, n_envs, fps, wall, args.warmup, args.steps, args.device])
+            w.writerow([mode, n_envs, fps, wall, args.steps, args.device])
 
     # plot
     xs = [r[0] for r in results if not (np.isnan(r[1]))]

@@ -8,11 +8,12 @@ from models.mask_bbox import mask_to_bboxes
 from models.object_grid import build_object_grid
 
 from ai2thor.controller import Controller
+from ai2thor.platform import CloudRendering
 
 class ThorObjNavEnv(gym.Env):
     metadata = {"render_modes": []}
 
-    def __init__(self, scenes, targets_by_room, resnet, embed, osm, omt, device="cpu", debug=False):
+    def __init__(self, scenes, targets_by_room, resnet, embed, osm, omt, device="cpu", debug=False, headless=False):
         super().__init__()
         self.scenes = scenes # 可用的 THOR 场景列表， reset() 时会随机选一个
         self.targets_by_room = targets_by_room # 每个房间允许的目标物体集合
@@ -33,6 +34,8 @@ class ThorObjNavEnv(gym.Env):
         self.scene = None # 当前场景
         self.goal = None # 当前目标物体
 
+        self.headless = headless # 是否使用无头模式
+
         # 机器人的9个离散动作 𝒜 = {Move Forward, Move Backward, Move Right, Move Left, Rotate Right, Rotate Left, Look Up, Look Down, Done}
         self.action_space = gym.spaces.Discrete(9)
         # Transformers的输出（300维特征向量），用于后续的RL策略网络
@@ -44,17 +47,28 @@ class ThorObjNavEnv(gym.Env):
     # 用于启动或重启 AI2-THOR 仿真世界
     def _init_controller(self, scene):
         if self.controller is None:
-            # 启动新的 controller
-            self.controller = Controller(
-                scene=scene, # 场景名称
-                width=CFG.width, # 渲染图像宽度
-                height=CFG.height, # 渲染图像高度
-                renderInstanceSegmentation=True, # 需要每一步返回实例分割图, 用于计算目标物体的 bbox
-                renderDepthImage=False, # 不需要深度图
-            )
+            if self.headless:
+                # 启动新的 controller(无头模式)
+                self.controller = Controller(
+                    scene=scene, # 场景名称
+                    width=CFG.width, # 渲染图像宽度
+                    height=CFG.height, # 渲染图像高度
+                    renderInstanceSegmentation=True, # 需要每一步返回实例分割图, 用于计算目标物体的 bbox
+                    renderDepthImage=False, # 不需要深度图
+                    platform=CloudRendering, # 使用云渲染平台，无头模式
+                )
+            else:
+                # 启动新的 controller
+                self.controller = Controller(
+                    scene=scene, # 场景名称
+                    width=CFG.width, # 渲染图像宽度
+                    height=CFG.height, # 渲染图像高度
+                    renderInstanceSegmentation=True, # 需要每一步返回实例分割图, 用于计算目标物体的 bbox
+                    renderDepthImage=False, # 不需要深度图
+                )
         else:
             # 重置到新场景
-            self.controller.reset(scene)
+            self.controller.reset(scene=scene)
     
     # 重置环境，开始一个新的 episode
     def reset(self, seed=None, options=None):
