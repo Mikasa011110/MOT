@@ -3,11 +3,13 @@
 # 训练吞吐/FPS 基准测试（多环境 sweep），与 train_a2c.py 的 env 构造保持一致
 #
 # 用法：
-#   # 小规模 sanity check（FloorPlan1-20 + GarbageCan）
-#   xvfb-run -a python -u test.py --smalltest --envs 1 2 4 8 --steps 200
+#   # 小规模headless sanity check（FloorPlan1-20 + GarbageCan）
+#   python -u test.py --smalltest --headless --step=200 --w2v-path /home/ubuntu/gensim-data/word2vec-google-news-300/word2vec-google-news-300
+    # 小规模有渲染
+#   python -u test.py --smalltest --step=200 --w2v-path /home/ubuntu/gensim-data/word2vec-google-news-300/word2vec-google-news-300
 #
 #   # 论文训练设置（TRAIN_SCENES + TARGETS）
-#   xvfb-run -a python -u test.py --envs 1 2 4 8 --steps 2000
+#   python -u test.py --headless --w2v-path /home/ubuntu/gensim-data/word2vec-google-news-300/word2vec-google-news-300
 #
 # 输出：
 #   logs_fps/fps_env_sweep.csv
@@ -40,7 +42,17 @@ def _full_paper_splits():
     return TRAIN_SCENES, TARGETS
 
 
-def make_env(rank: int, seed: int, scenes, targets_by_room, backbone_device: str, w2v_path: str | None, debug: bool, headless: bool) -> Callable[[], ThorObjNavEnv]:
+def make_env(
+    rank: int,
+    seed: int,
+    scenes,
+    targets_by_room,
+    backbone_device: str,
+    w2v_path: str | None,
+    embed_table: dict | None,
+    debug: bool,
+    headless: bool,
+) -> Callable[[], ThorObjNavEnv]:
     """
     返回一个可调用对象，用于 SubprocVecEnv/DummyVecEnv 创建 env。
     重要：每个子进程必须独立创建 Controller + 模型实例。
@@ -49,7 +61,7 @@ def make_env(rank: int, seed: int, scenes, targets_by_room, backbone_device: str
         device = backbone_device
 
         resnet = ResNet50Encoder(device=device)
-        embed = WordEmbed(local_path=w2v_path)
+        embed = WordEmbed(precomputed=embed_table) if embed_table is not None else WordEmbed(local_path=w2v_path)
         osm = OSM(hist_len=CFG.hist_len, grid_size=CFG.grid_size, device=device).to(device)
         omt = OMTTransformer(d_model=300, nhead=4, num_layers=1, device=device).to(device)
 
@@ -70,16 +82,16 @@ def make_env(rank: int, seed: int, scenes, targets_by_room, backbone_device: str
     return _init
 
 
-def build_vec_env(n_envs: int, seed: int, scenes, targets_by_room, backbone_device: str, w2v_path: str | None, debug: bool, headless: bool):
-    fns = [make_env(i, seed, scenes, targets_by_room, backbone_device, w2v_path, debug, headless) for i in range(n_envs)]
+def build_vec_env(n_envs: int, seed: int, scenes, targets_by_room, backbone_device: str, w2v_path: str | None, embed_table: dict | None, debug: bool, headless: bool):
+    fns = [make_env(i, seed, scenes, targets_by_room, backbone_device, w2v_path, embed_table, debug, headless) for i in range(n_envs)]
     if n_envs <= 1:
         return DummyVecEnv([fns[0]])
     # spawn 更稳，避免 fork 复制 CUDA/Controller 状态
     return SubprocVecEnv(fns, start_method="spawn")
 
 
-def run_fps_once(n_envs: int, *, seed: int, scenes, targets_by_room, backbone_device: str, w2v_path: str | None, steps: int, debug: bool, headless: bool):
-    env = build_vec_env(n_envs, seed, scenes, targets_by_room, backbone_device, w2v_path, debug, headless)
+def run_fps_once(n_envs: int, *, seed: int, scenes, targets_by_room, backbone_device: str, w2v_path: str | None, embed_table: dict | None, steps: int, debug: bool, headless: bool):
+    env = build_vec_env(n_envs, seed, scenes, targets_by_room, backbone_device, w2v_path, embed_table, debug, headless)
 
     # reset
     env.reset()
@@ -105,13 +117,21 @@ def main():
                         help="True: FloorPlan1-20(Kitchen) + GarbageCan; False: 论文设置（scene_split TRAIN_SCENES+TARGETS）")
     parser.add_argument("--envs", type=int, nargs="+", default=[1, 4, 8, 16], help="要测试的 n_envs 列表")
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--steps", type=int, default=2000, help="计时阶段循环次数（每次 step 走 n_envs 个 transition）")
+    parser.add_argument("--steps", type=int, default=200, help="计时阶段循环次数（每次 step 走 n_envs 个 transition）")
     parser.add_argument("--device", type=str, default="cpu", choices=["cpu", "cuda"], help="resnet/osm/omt 的 device")
-    parser.add_argument("--w2v-path", type=str, default=None, help="本地 word2vec 文件路径（.bin/.txt/.kv），离线服务器建议提供")
+    parser.add_argument("--w2v-table", type=str, default=None, help="预先计算好的 w2v table (.npz)，推荐用于训练/测试")
+    parser.add_argument("--w2v-path", type=str, default=None, help="原始 3.4GB word2vec 文件路径（仅离线建表时需要，不推荐多进程直接加载）")
     parser.add_argument("--out-dir", type=str, default="logs_fps")
     parser.add_argument("--debug", action="store_true")
     parser.add_argument("--headless", action="store_true", help="Use AI2-THOR headless mode (CloudRendering).")
     args = parser.parse_args()
+
+    embed_table = None
+    if args.w2v_table is not None:
+        embed_table = WordEmbed.load_table(args.w2v_table)
+        print(f"[W2V] loaded table: {args.w2v_table} (size={len(embed_table)})", flush=True)
+    else:
+        print("[W2V] WARNING: --w2v-table not set. Subprocesses may try to load the 3.4GB model.", flush=True)
 
     # config (smalltest vs paper)
     if args.smalltest:
@@ -141,6 +161,7 @@ def main():
                 targets_by_room=targets_by_room,
                 backbone_device=args.device,
                 w2v_path=args.w2v_path,
+                embed_table=embed_table,
                 steps=args.steps,
                 debug=args.debug,
                 headless=args.headless,
