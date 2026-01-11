@@ -346,6 +346,12 @@ def worker_loop(
                 rgb_t, grid_t, goal_t = preprocess_obs(obs)
 
                 logits, value = local_model(rgb_t, grid_t, goal_t)
+
+                # --- NaN/Inf guard: avoid worker crash due to invalid logits ---
+                if not torch.isfinite(logits).all():
+                    print(f"[NAN] worker{rank} logits not finite; patching with nan_to_num", flush=True)
+                    logits = torch.nan_to_num(logits, nan=0.0, posinf=0.0, neginf=0.0)
+
                 dist = Categorical(logits=logits)
                 action = dist.sample()
 
@@ -568,7 +574,6 @@ def main():
         csv_w.writeheader()
         csv_f.flush()
 
-        win = deque(maxlen=100)
         win = deque(maxlen=100)
         ep_total = 0
         last_sr_print_ep = 0
