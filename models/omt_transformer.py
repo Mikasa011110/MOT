@@ -122,15 +122,25 @@ class OMTTransformer(nn.Module):
             mem = mem.repeat(wg.size(0), 1, 1)
             B = wg.size(0)
 
+                # --- build padding mask BEFORE temporal encoding ---
+        # Empty slots in OSM are padded with all-zero vectors (paper: masked attention for empty memory slots).
+        # True values in key_padding_mask indicate positions that should be ignored by attention.
+        pad_mask = (mem.abs().sum(dim=-1) == 0)  # (B,T) bool
+
         mem = mem.to(self.device)
         wg = wg.to(self.device)
+        pad_mask = pad_mask.to(mem.device)
 
-        # --- encode memory ---
-        mem = self.temporal(mem)           # (B,T,D)
-        mem_enc = self.encoder(mem)        # (B,T,D)
+        # --- encode memory (masked self-attention over non-empty slots) ---
+        mem = self.temporal(mem)  # (B,T,D)
+        mem_enc = self.encoder(mem, src_key_padding_mask=pad_mask)  # (B,T,D)
 
-        # --- cross attention: query=wg, key/value=mem_enc ---
-        attn_out, _ = self.cross_attn(query=wg, key=mem_enc, value=mem_enc, need_weights=False)  # (B,1,D)
+        # --- cross attention: query=wg, key/value=mem_enc (mask empty slots) ---
+        attn_out, _ = self.cross_attn(
+            query=wg, key=mem_enc, value=mem_enc,
+            key_padding_mask=pad_mask,
+            need_weights=False,
+        )  # (B,1,D)
 
         x = attn_out.squeeze(1)            # (B,D)
         x = x + self.ffn(x)                # residual-ish
