@@ -1,0 +1,31 @@
+# ===============================
+# PyTorch / ML model checkpoints
+# ===============================
+*.pt
+*.pth
+*.ckpt
+*.onnx
+
+# ===============================
+# RL training outputs
+# ===============================
+runs/
+logs/
+wandb/
+tensorboard/
+checkpoints/
+
+# ===============================
+# Temporary / cache
+# ===============================
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# ===============================
+# OS / Editor
+# ===============================
+.DS_Store
+.vscode/
+.idea/
