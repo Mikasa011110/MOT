@@ -4,8 +4,10 @@ from dataclasses import dataclass
 @dataclass
 class OMTConfig:
     # Observation
-    width: int = 400
-    height: int = 300
+    # width: int = 400
+    # height: int = 300
+    width: int = 224
+    height: int = 224
     grid_size: int = 16
 
     # Discrete motion (paper)
@@ -18,7 +20,8 @@ class OMTConfig:
     visible_distance: float = 1.5   # meters (paper)
 
     # Memory
-    hist_len: int = 4               # OMT-4 first
+    hist_len: int = 32               # 论文中OMT使用的 memory 长度
+    nhead: int = 4                  # multi-head attention 的并行子空间数
 
     # Reward
     success_reward: float = 5.0

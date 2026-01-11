@@ -23,7 +23,7 @@ import os
 from stable_baselines3 import A2C
 from stable_baselines3.common.callbacks import CheckpointCallback, EvalCallback
 from stable_baselines3.common.utils import set_random_seed
-from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv, VecMonitor, VecNormalize
+from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv, VecMonitor, VecNormalize, VecTransposeImage
 
 from configs import CFG
 from callbacks_success import SuccessLoggerCallback
@@ -31,12 +31,8 @@ from callbacks_success import SuccessLoggerCallback
 from envs.thor_objnav_env import ThorObjNavEnv
 from envs.scene_split import TRAIN_SCENES, TARGETS
 
-from models.resnet_encoder import ResNet50Encoder
 from models.word2vec_embed import WordEmbed
-from models.osm import OSM
-from models.omt_transformer import OMTTransformer
-
-
+from models.simple_feature_extractor import SimpleObjNavExtractor
 KITCHEN20_SCENES = [f"FloorPlan{i}" for i in range(1, 21)]
 
 
@@ -52,31 +48,24 @@ def make_env_fn(
     seed: int,
     scenes: List[str],
     targets_by_room: Dict[str, List[str]],
-    backbone_device: str,
     debug: bool,
     w2v_table_path: str | None = None,
 ) -> Callable[[], ThorObjNavEnv]:
-    """Factory for VecEnv. Each process must create its own Controller/backbone/memory."""
+    """Factory for VecEnv. Each process creates its own Controller + lightweight embed for grid."""
     def _init() -> ThorObjNavEnv:
         env_seed = seed + rank
 
-        resnet = ResNet50Encoder(device=backbone_device)
-        # IMPORTANT: avoid loading 3.4GB w2v in each subprocess.
-        # Recommended: pass --w2v-table to load a small precomputed npz table in each worker.
+        # Each worker loads the lightweight Word2Vec table (recommended) to build the object grid.
         embed = WordEmbed(table_path=w2v_table_path) if w2v_table_path is not None else WordEmbed()
 
-        osm = OSM(hist_len=CFG.hist_len, grid_size=CFG.grid_size, device=backbone_device).to(backbone_device)
-        omt = OMTTransformer(d_model=300, nhead=4, num_layers=1, device=backbone_device).to(backbone_device)
-
+        # B1: env is lightweight and returns dict obs (rgb/grid/goal_id). No ResNet/OSM/OMT in env.
         env = ThorObjNavEnv(
             scenes=scenes,
             targets_by_room=targets_by_room,
-            resnet=resnet,
             embed=embed,
-            osm=osm,
-            omt=omt,
-            device=backbone_device,
+            device="cpu",
             debug=debug,
+            headless=False,
         )
         env.reset(seed=env_seed)
         return env
@@ -88,7 +77,6 @@ def build_vec_env(
     seed: int,
     scenes: List[str],
     targets_by_room: Dict[str, List[str]],
-    backbone_device: str,
     debug: bool,
     use_subproc: bool = True,
     w2v_table_path: str | None = None,
@@ -99,7 +87,6 @@ def build_vec_env(
             seed=seed,
             scenes=scenes,
             targets_by_room=targets_by_room,
-            backbone_device=backbone_device,
             debug=debug,
             w2v_table_path=w2v_table_path,
         )
@@ -187,7 +174,6 @@ def main():
     set_random_seed(args.seed)
 
     policy_device = args.device
-    backbone_device = args.backbone_device or args.device
 
     # ----- scenes/targets config -----
     if args.smalltest:
@@ -224,7 +210,6 @@ def main():
         seed=args.seed,
         scenes=scenes,
         targets_by_room=targets_by_room,
-        backbone_device=backbone_device,
         debug=args.debug or getattr(CFG, "debug", False),
         use_subproc=True,
         w2v_table_path=args.w2v_table,
@@ -234,7 +219,6 @@ def main():
         seed=args.seed + 10_000,
         scenes=scenes,
         targets_by_room=targets_by_room,
-        backbone_device=backbone_device,
         debug=False,
         use_subproc=False,
         w2v_table_path=args.w2v_table,
@@ -246,12 +230,20 @@ def main():
         eval_env.training = False
         eval_env.norm_reward = False
 
+    # Ensure both training and eval env have the same image wrapper (avoids eval type mismatch warning)
+    env = VecTransposeImage(env)
+    eval_env = VecTransposeImage(eval_env)
+
     lr = linear_schedule(args.lr) if args.lr_linear_decay else args.lr
 
-    policy_kwargs = dict(net_arch=[256, 256])
+    policy_kwargs = dict(
+        net_arch=[256, 256],
+        features_extractor_class=SimpleObjNavExtractor,
+        features_extractor_kwargs=dict(d_vis=256, d_grid=128, d_goal=64, device=policy_device),
+    )
 
     model = A2C(
-        policy="MlpPolicy",
+        policy="MultiInputPolicy",
         env=env,
         device=policy_device,
         n_steps=args.n_steps,

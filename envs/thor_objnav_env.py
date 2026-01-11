@@ -4,24 +4,30 @@ import numpy as np
 from ai2thor.controller import Controller
 
 from configs import CFG
-from models.mask_bbox import mask_to_bboxes
 from models.object_grid import build_object_grid
 
 from ai2thor.controller import Controller
-from ai2thor.platform import CloudRendering
+
+from gymnasium import spaces
 
 class ThorObjNavEnv(gym.Env):
     metadata = {"render_modes": []}
 
-    def __init__(self, scenes, targets_by_room, resnet, embed, osm, omt, device="cpu", debug=False, headless=False):
+    def __init__(self, scenes, targets_by_room, embed, device="cpu", debug=False, headless=False):
         super().__init__()
         self.scenes = scenes # 可用的 THOR 场景列表， reset() 时会随机选一个
         self.targets_by_room = targets_by_room # 每个房间允许的目标物体集合
 
-        self.resnet = resnet
-        self.embed = embed
-        self.osm = osm
-        self.omt = omt
+        self.embed = embed  # Word2Vec 封装，用于构建 object grid（env 端轻量计算）
+
+        # ---- goal vocabulary (string -> id) ----
+        all_goals = []
+        for _, lst in self.targets_by_room.items():
+            all_goals.extend([str(x) for x in lst])
+        self.goal_vocab = sorted(list(set(all_goals)))
+        self.goal_to_id = {g: i for i, g in enumerate(self.goal_vocab)}
+        self.goal_id = 0  # will be set in reset()
+
         self.device = device
 
         self.last_success = False # 记录上一个 episode 是否成功
@@ -38,8 +44,12 @@ class ThorObjNavEnv(gym.Env):
 
         # 机器人的9个离散动作 𝒜 = {Move Forward, Move Backward, Move Right, Move Left, Rotate Right, Rotate Left, Look Up, Look Down, Done}
         self.action_space = gym.spaces.Discrete(9)
-        # Transformers的输出（300维特征向量），用于后续的RL策略网络
-        self.observation_space = gym.spaces.Box(low=-np.inf, high=np.inf, shape=(300,), dtype=np.float32)
+        # Transformers的输出作为观测空间
+        self.observation_space = spaces.Dict({
+            "rgb": spaces.Box(low=0, high=255, shape=(CFG.height, CFG.width, 3), dtype=np.uint8),
+            "grid": spaces.Box(low=-1.0, high=1.0, shape=(CFG.grid_size, CFG.grid_size), dtype=np.float32),
+            "goal_id": spaces.Discrete(len(self.goal_vocab)),
+        })
 
         self.controller = None 
         self.debug = debug # 是否打印调试信息
@@ -55,7 +65,7 @@ class ThorObjNavEnv(gym.Env):
                     height=CFG.height, # 渲染图像高度
                     renderInstanceSegmentation=True, # 需要每一步返回实例分割图, 用于计算目标物体的 bbox
                     renderDepthImage=False, # 不需要深度图
-                    platform=CloudRendering, # 使用云渲染平台，无头模式
+                    # platform=CloudRendering, # 使用云渲染平台，无头模式
                 )
             else:
                 # 启动新的 controller
@@ -75,8 +85,6 @@ class ThorObjNavEnv(gym.Env):
         super().reset(seed=seed)
         self.step_count = 0 # 重置步数
         self.best_sbbox = 0.0 # 重置最大 S_bbox
-        self.osm.reset() # 重置 OSM 记忆
-
         self.last_any_visible = False # 上一步的目标是否可见
         self.last_found = False  # 上一步的目标是否存在
         self.last_best_dist = float("inf") # 上一步agent和goal最短距离
@@ -109,6 +117,7 @@ class ThorObjNavEnv(gym.Env):
         candidates = self.targets_by_room[room_type]
         self.goal = str(self.np_random.choice(candidates))
 
+        self.goal_id = int(self.goal_to_id[self.goal])
         # ---- randomize start position (version-stable) ----
         ev = self.controller.step(action="GetReachablePositions")
         if ev.metadata.get("lastActionSuccess") is False:
@@ -138,6 +147,7 @@ class ThorObjNavEnv(gym.Env):
         tries = 0
         while (not goal_exists(self.goal)) and tries < 10:
             self.goal = str(self.np_random.choice(candidates))
+            self.goal_id = int(self.goal_to_id[self.goal])
             tries += 1
 
         obs = self._get_obs()
@@ -197,7 +207,7 @@ class ThorObjNavEnv(gym.Env):
 
         # info (every step)
         info = {
-            "goal": self.goal,
+            "goal_id": np.int64(self.goal_id),
             "sbbox": float(sbbox),
             "best_sbbox": float(self.best_sbbox),
             "any_visible": int(self.last_any_visible),
@@ -228,22 +238,45 @@ class ThorObjNavEnv(gym.Env):
 
         return obs, reward, terminated, truncated, info
 
-    # 把 THOR 的事件 ev（RGB + instance seg + metadata）变成 RL 需要的 一个 300 维向量 feat。
+    # 从 2D 实例检测结果中提取边界框
+    def _bboxes_from_instance_detections2D(self, ev):
+        det = getattr(ev, "instance_detections2D", None)
+        if det is None:
+            # 有的版本放在 ev.metadata
+            det = ev.metadata.get("instance_detections2D", None)
+
+        bboxes = {}
+        if not det:
+            return bboxes
+
+        # det: dict[objId -> np.array([x1,y1,x2,y2])]
+        for obj_id, arr in det.items():
+            x1, y1, x2, y2 = [float(v) for v in arr]
+            # clip 到图像范围，避免越界
+            x1 = max(0.0, min(x1, CFG.width - 1))
+            y1 = max(0.0, min(y1, CFG.height - 1))
+            x2 = max(0.0, min(x2, CFG.width - 1))
+            y2 = max(0.0, min(y2, CFG.height - 1))
+            if x2 <= x1 or y2 <= y1:
+                continue
+            area = (x2 - x1) * (y2 - y1)  # bbox 面积（像素^2）
+            bboxes[obj_id] = (x1, y1, x2, y2, float(area))
+        return bboxes
+    
+    # 获取当前观测
     def _get_obs(self, ev=None):
         if ev is None:
             ev = self.controller.last_event
 
         rgb = ev.frame  # HxWx3 uint8
-        inst = ev.instance_segmentation_frame  # HxWx3 uint8
 
-        # objectId -> objectType
+        # 构建 object_id -> object_type 映射
         object_id_to_type = {o["objectId"]: o["objectType"] for o in ev.metadata["objects"]}
 
-        # mask -> bboxes
-        bboxes = mask_to_bboxes(inst, ev.color_to_object_id)
-        
+        # 提取 2D 边界框
+        bboxes = self._bboxes_from_instance_detections2D(ev)
 
-        # build target-relevance grid
+        # 构建object_grid
         grid, kept, ignored = build_object_grid(
             bboxes=bboxes,
             object_id_to_type=object_id_to_type,
@@ -254,27 +287,17 @@ class ThorObjNavEnv(gym.Env):
             grid_size=CFG.grid_size,
         )
 
-        # resnet feature
-        v = self.resnet.encode(rgb)  # torch tensor 2048
-        self.osm.push(v, grid)
-
-        wg = self.embed(self.goal).to(self.device) # 生成目标词向量 wg: (300,)
-        mem = self.osm().to(self.device)          # 从 Object Semantic Memory (OSM) 中读取历史观测的记忆序列
-
-        # 将目标语义向量 w_g 作为查询（query），记忆序列 M 作为键值（key/value）
-        # 通过目标条件化的 Transformer（OMT）对历史记忆进行注意力检索
-        # 输出 feat 是一个 300 维的目标相关状态表征，用于后续策略网络决策
-        feat = self.omt(mem, wg)   # shape: (300,)
-        obs = feat.detach().cpu().numpy().astype(np.float32)
+        obs = {
+            "rgb": rgb,
+            "grid": grid.astype(np.float32),
+            "goal_id": np.int64(self.goal_id),
+        }
 
         # debug info
         if self.debug and self.step_count % 50 == 0:
             nz = int((grid > 0).sum())
             mx = float(grid.max())
             print(f"[BBOX] n_bboxes={len(bboxes)} kept={kept} ignored={ignored}   [GRID] nonzero={nz} max={mx:.3f} goal={self.goal}")
-        
-        cur_grid_max = float(grid.max())
-        self.cur_grid_max = cur_grid_max # 记录当前步的 grid max
 
         return obs
 
