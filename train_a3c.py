@@ -44,20 +44,51 @@ from envs.thor_objnav_env import ThorObjNavEnv
 # ---------------------------
 # Shared Adam (Hogwild)
 # ---------------------------
-class SharedAdam(torch.optim.Adam):
-    """Adam optimizer whose state tensors are placed in shared memory (A3C classic)."""
+# ---------------------------
+# Shared RMSprop (Hogwild)
+# ---------------------------
+class SharedRMSprop(torch.optim.RMSprop):
+    """
+    RMSprop optimizer whose state tensors are placed in shared memory (A3C classic).
+    Paper-aligned: RMSprop + linear learning-rate decay to 0.
+    """
 
-    def __init__(self, params, lr=1e-4, betas=(0.9, 0.999), eps=1e-8, weight_decay=0):
-        super().__init__(params, lr=lr, betas=betas, eps=eps, weight_decay=weight_decay)
+    def __init__(
+        self,
+        params,
+        lr=7e-4,
+        alpha=0.99,
+        eps=1e-5,
+        weight_decay=0.0,
+        momentum=0.0,
+        centered=False,
+    ):
+        super().__init__(
+            params,
+            lr=lr,
+            alpha=alpha,
+            eps=eps,
+            weight_decay=weight_decay,
+            momentum=momentum,
+            centered=centered,
+        )
         for group in self.param_groups:
             for p in group["params"]:
                 state = self.state[p]
+                # torch.optim.RMSprop maintains these buffers
                 state["step"] = torch.zeros(1)
-                state["exp_avg"] = torch.zeros_like(p.data)
-                state["exp_avg_sq"] = torch.zeros_like(p.data)
+                state["square_avg"] = torch.zeros_like(p.data)
+                if momentum > 0:
+                    state["momentum_buffer"] = torch.zeros_like(p.data)
+                if centered:
+                    state["grad_avg"] = torch.zeros_like(p.data)
+
                 state["step"].share_memory_()
-                state["exp_avg"].share_memory_()
-                state["exp_avg_sq"].share_memory_()
+                state["square_avg"].share_memory_()
+                if momentum > 0:
+                    state["momentum_buffer"].share_memory_()
+                if centered:
+                    state["grad_avg"].share_memory_()
 
 
 # ---------------------------
@@ -67,6 +98,19 @@ def set_global_seeds(seed: int):
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
+
+def linear_lr_decay(base_lr: float, step: int, total_steps: int) -> float:
+    """
+    Paper-aligned linear learning-rate decay:
+      lr(step) = base_lr * (1 - step/total_steps), clamped to [0, base_lr].
+    We use global_step in frames as the step counter.
+    """
+    if total_steps <= 0:
+        return float(base_lr)
+    p = float(step) / float(total_steps)
+    lr = float(base_lr) * max(0.0, 1.0 - p)
+    return lr
+
 
 
 def choose_scenes_and_targets(smalltest: bool) -> Tuple[List[str], Dict[str, List[str]]]:
@@ -276,7 +320,7 @@ def worker_loop(
     rank: int,
     args,
     shared_model: A3CObjNavNet,
-    optimizer: SharedAdam,
+    optimizer: SharedRMSprop,
     global_step: mp.Value,
     opt_lock: mp.Lock,
     stats_q,
@@ -392,6 +436,7 @@ def worker_loop(
                                 "best_sbbox": float(round(float(info.get("best_sbbox", 0.0)), 3)),
                                 "episode_ever_visible": int(bool(info.get("episode_ever_visible", False))),
                                 "episode_min_dist": float(round(float(info.get("episode_min_dist", -1.0)), 3)),
+                                "lr": float(linear_lr_decay(float(args.lr), int(gs), int(args.total_frames))),
                                 "scene": str(getattr(env, "scene", "")),
                                 "goal": str(getattr(env, "goal", "")),
                             },
@@ -439,6 +484,11 @@ def worker_loop(
             torch.nn.utils.clip_grad_norm_(local_model.parameters(), cfg.max_grad_norm)
 
             with opt_lock:
+                # Paper-aligned linear LR decay (based on global frames)
+                lr_now = linear_lr_decay(float(args.lr), int(global_step.value), int(args.total_frames))
+                for pg in optimizer.param_groups:
+                    pg["lr"] = lr_now
+
                 ensure_shared_grads(local_model, shared_model)
                 optimizer.step()
 
@@ -467,7 +517,7 @@ def main():
     parser.add_argument("--value-coef", type=float, default=0.5)
     parser.add_argument("--entropy-coef", type=float, default=0.01)
     parser.add_argument("--max-grad-norm", type=float, default=40.0)
-    parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--lr", type=float, default=7e-4)
     parser.add_argument("--device", type=str, default="cpu")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--debug", action="store_true")
@@ -503,7 +553,7 @@ def main():
     )
     shared_model.share_memory()
 
-    optimizer = SharedAdam(shared_model.parameters(), lr=args.lr)
+    optimizer = SharedRMSprop(shared_model.parameters(), lr=args.lr)
 
     global_step = mp.Value("i", 0, lock=True)
     opt_lock = mp.Lock()
@@ -553,6 +603,7 @@ def main():
         csv_path = os.path.join(log_dir, "train_log.csv")
         csv_fields = [
             "global_step",
+            "lr",
             "episode_index",
             "episode_return",
             "episode_len",
