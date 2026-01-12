@@ -2,11 +2,10 @@
 import gymnasium as gym
 import numpy as np
 from ai2thor.controller import Controller
+from ai2thor.platform import CloudRendering
 
 from configs import CFG
 from models.object_grid import build_object_grid
-
-from ai2thor.controller import Controller
 
 from gymnasium import spaces
 
@@ -57,25 +56,18 @@ class ThorObjNavEnv(gym.Env):
     # 用于启动或重启 AI2-THOR 仿真世界
     def _init_controller(self, scene):
         if self.controller is None:
+            # 统一通过 kwargs 构造，headless 时启用 CloudRendering
+            kwargs = dict(
+                scene=scene,
+                width=CFG.width,
+                height=CFG.height,
+                renderInstanceSegmentation=True,
+                renderDepthImage=False,
+            )
             if self.headless:
-                # 启动新的 controller(无头模式)
-                self.controller = Controller(
-                    scene=scene, # 场景名称
-                    width=CFG.width, # 渲染图像宽度
-                    height=CFG.height, # 渲染图像高度
-                    renderInstanceSegmentation=True, # 需要每一步返回实例分割图, 用于计算目标物体的 bbox
-                    renderDepthImage=False, # 不需要深度图
-                    # platform=CloudRendering, # 使用云渲染平台，无头模式
-                )
-            else:
-                # 启动新的 controller
-                self.controller = Controller(
-                    scene=scene, # 场景名称
-                    width=CFG.width, # 渲染图像宽度
-                    height=CFG.height, # 渲染图像高度
-                    renderInstanceSegmentation=True, # 需要每一步返回实例分割图, 用于计算目标物体的 bbox
-                    renderDepthImage=False, # 不需要深度图
-                )
+                # 官方 headless/off-screen 渲染方式：platform=CloudRendering
+                kwargs["platform"] = CloudRendering
+            self.controller = Controller(**kwargs)
         else:
             # 重置到新场景
             self.controller.reset(scene=scene)
@@ -221,6 +213,9 @@ class ThorObjNavEnv(gym.Env):
             info["episode_len"] = int(self.step_count)
             info["episode_min_dist"] = float(self.last_best_dist)
             info["episode_ever_visible"] = int(self.last_any_visible)
+            # save identifiers for logging
+            info["scene"] = str(self.scene)
+            info["goal"] = str(self.goal)
 
             if self.debug:
                 print(
