@@ -25,14 +25,13 @@ class OMTConfig:
 
     # Reward
     success_reward: float = 5.0
-    step_penalty: float = -0.01
+    step_penalty: float = -0.02
     success_distance = 1.5 
     sbbox_coef = 1.0
 
     total_timesteps: int = 20_000  # 默认的训练总步数
 
     debug: bool = False            # 是否打印调试信息
-    headless: bool = False         # 是否使用无头模式运行环境
 
 
 CFG = OMTConfig()

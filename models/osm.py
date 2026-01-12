@@ -1,163 +1,132 @@
-"""models/osm.py
-
-Scheme-A (CPU actors + GPU learner) friendly OSM implementation.
-
-We split OSM into:
-  - OSMCore: trainable parameters (fv, fo, fm)
-  - OSMState: per-actor ring buffer (stores v2048 + grid)
-
-Why: in a centralized GPU learner setup, *parameters* should be shared (single
-copy on GPU), while *memory state* must be independent per actor/episode.
-"""
-
-from __future__ import annotations
-
-from dataclasses import dataclass
-from collections import deque
-from typing import Deque, Tuple
-
+# models/osm.py
+import numpy as np
 import torch
 import torch.nn as nn
 
 
-@dataclass
-class OSMState:
-    """Per-actor OSM ring buffer state (no parameters).
+class OSM(nn.Module):
+    """
+    Object-Scene Memory (OSM)
 
-    Stores the last ``hist_len`` tuples of:
-      - v2048: torch.Tensor shape (2048,) (typically CPU tensor)
-      - grid256: torch.Tensor shape (256,) (typically CPU tensor)
+    论文中的 OSM 用于：
+    - 存储最近 T 个时间步的“场景外观 + 目标相关物体语义”
+    - 将每个时间步的信息融合成一个 300 维 memory token
+    - 输出一个 (T, 300) 的 memory 序列，供 Object Memory Transformer (OMT) 使用
+
+    对应论文公式：
+        m_t = f_m( f_v(v_t), f_o(o_t) )
     """
 
-    hist_len: int
-    v_buf: Deque[torch.Tensor]
-    g_buf: Deque[torch.Tensor]
-
-    @classmethod
-    def create(cls, hist_len: int) -> "OSMState":
-        return cls(hist_len=hist_len, v_buf=deque(maxlen=hist_len), g_buf=deque(maxlen=hist_len))
-
-    def reset(self):
-        self.v_buf.clear()
-        self.g_buf.clear()
-
-    def push(self, v2048: torch.Tensor, grid256: torch.Tensor):
-        # Store on CPU by default to keep actor state light; learner will move to GPU when needed.
-        self.v_buf.append(v2048.detach().float().cpu())
-        self.g_buf.append(grid256.detach().float().cpu())
-
-    def padded_stacks(self, device: torch.device) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Return padded stacks (T,2048) and (T,256) on ``device``.
-
-        Pads *in front* with zeros if shorter than hist_len.
+    def __init__(self, hist_len=4, grid_size=16, device="cpu"):
         """
-
-        T = self.hist_len
-        n = len(self.v_buf)
-        if n == 0:
-            v = torch.zeros((T, 2048), device=device)
-            g = torch.zeros((T, 256), device=device)
-            return v, g
-
-        v_list = list(self.v_buf)
-        g_list = list(self.g_buf)
-
-        v_stack = torch.stack(v_list, dim=0).to(device, non_blocking=True)  # (n,2048)
-        g_stack = torch.stack(g_list, dim=0).to(device, non_blocking=True)  # (n,256)
-
-        if n < T:
-            pad_v = torch.zeros((T - n, 2048), device=device)
-            pad_g = torch.zeros((T - n, 256), device=device)
-            v_stack = torch.cat([pad_v, v_stack], dim=0)
-            g_stack = torch.cat([pad_g, g_stack], dim=0)
-
-        return v_stack, g_stack
-
-
-class OSMCore(nn.Module):
-    """Trainable part of OSM: fv, fo, fm.
-
-    Matches the paper's Eq.(1): m_t = f_m( f_v(v_t), f_o(o_t) )
-    """
-
-    def __init__(self, grid_size: int = 16):
+        Args:
+            hist_len (int): 记忆长度 T（即 Transformer 看到的历史步数）
+            grid_size (int): object grid 的边长（论文中为 16）
+            device (str): 运行设备 cpu / cuda
+        """
         super().__init__()
+        self.hist_len = hist_len
+        self.device = device
 
+        # ========= 论文中的三个子网络 =========
+        # f_v : 场景外观编码
+        #   输入：ResNet-50 提取的 2048 维视觉特征
+        #   输出：300 维场景嵌入
         self.fv = nn.Sequential(
             nn.Linear(2048, 512),
             nn.ReLU(),
-            nn.Linear(512, 300),
+            nn.Linear(512, 300)
         )
 
+        # f_o : 目标相关物体语义编码
+        #   输入：16x16 的 object context grid（展平后 256 维）
+        #   输出：300 维物体语义嵌入
         self.fo = nn.Sequential(
             nn.Linear(grid_size * grid_size, 512),
             nn.ReLU(),
-            nn.Linear(512, 300),
+            nn.Linear(512, 300)
         )
 
+        # f_m : 融合网络
+        #   输入：concat([scene_embed, object_embed]) → 600 维
+        #   输出：最终 memory token m_t（300 维）
         self.fm = nn.Sequential(
             nn.Linear(600, 300),
-            nn.ReLU(),
+            nn.ReLU()
         )
 
-    def fuse_tokens(self, v_stack: torch.Tensor, g_stack: torch.Tensor) -> torch.Tensor:
-        """Fuse stacked memory slots.
+        # 初始化 memory
+        self.reset()
+
+    def reset(self):
+        """
+        在 episode 开始时调用
+        清空 Object-Scene Memory
+
+        memory 中每个元素是：
+            (v2048, grid256)
+        """
+        self.mem = []  # list[(Tensor[2048], Tensor[256])]
+
+    @torch.no_grad()
+    def push(self, v2048: torch.Tensor, grid: np.ndarray):
+        """
+        向 OSM 中写入当前时间步的信息（写入阶段不参与反向传播）
 
         Args:
-            v_stack: (T,2048) on learner device
-            g_stack: (T,256)  on learner device
-        Returns:
-            mem_tokens: (T,300) on learner device
+            v2048 (Tensor): ResNet 提取的视觉特征，shape = (2048,)
+            grid (np.ndarray): 目标相关 object grid，shape = (16,16)
+
+        说明：
+        - OSM 是一个 ring buffer，只保留最近 hist_len 个时间步
+        - 超过 hist_len 时，最早的记忆会被丢弃
         """
-        vv = self.fv(v_stack)  # (T,300)
-        oo = self.fo(g_stack)  # (T,300)
-        m = self.fm(torch.cat([vv, oo], dim=-1))  # (T,300)
-        return m
+        # 将 grid 展平成 256 维向量
+        g = torch.from_numpy(grid.reshape(-1)).float()
 
+        # 如果 memory 满了，弹出最早的一步
+        if len(self.mem) >= self.hist_len:
+            self.mem.pop(0)
 
-class OSM(nn.Module):
-    """Backward-compatible OSM module used by train_a3c.py.
+        # 存储在 CPU 上，forward 时再搬到 device
+        self.mem.append((v2048.float().cpu(), g))
 
-    Your current training code expects:
-      - osm.reset()
-      - osm.push(v2048: Tensor(2048,), grid: np.ndarray(256,) or Tensor(256,))
-      - osm.forward() -> Tensor(T,300)  where T=hist_len
+    def forward(self):
+        """
+        从 OSM 中读取 memory，生成 Transformer 使用的 memory 序列
 
-    Internally this wrapper uses:
-      - OSMCore (trainable parameters)
-      - OSMState (per-episode ring buffer)
+        Returns:
+            Tensor:
+                shape = (T, 300)
+                T = hist_len
 
-    Note: This keeps the original "per-worker buffer inside the module" behavior,
-    which is fine for your current A3C implementation where each worker owns a
-    local_model instance.
-    """
+        注意：
+        - 若当前 episode 步数 < T，会在前面进行 zero padding
+        - padding token 理论上应在 Transformer 中被 mask 掉
+        """
+        T = self.hist_len
+        out = []
 
-    def __init__(self, hist_len: int = 5, grid_size: int = 16, device: str | torch.device = "cpu"):
-        super().__init__()
-        self.device = torch.device(device)
-        self.core = OSMCore(grid_size=grid_size)
-        self.state = OSMState.create(hist_len=hist_len)
-        self.core.to(self.device)
+        # 对 memory 中的每个时间步做特征融合
+        for (v, g) in self.mem:
+            # 场景外观编码
+            vv = self.fv(v.to(self.device))    # (300,)
 
-    @torch.no_grad()
-    def reset(self):
-        self.state.reset()
+            # 目标相关物体语义编码
+            oo = self.fo(g.to(self.device))    # (300,)
 
-    @torch.no_grad()
-    def push(self, v2048: torch.Tensor, grid256):
-        # v2048: (2048,) tensor
-        v = v2048.detach()
-        # grid256: np.ndarray(256,) or torch.Tensor(256,)
-        if isinstance(grid256, torch.Tensor):
-            g = grid256.detach()
-        else:
-            # assume numpy / list
-            g = torch.as_tensor(grid256)
-        g = g.float().view(-1)
-        if g.numel() != 256:
-            raise ValueError(f"grid256 must have 256 elements (16x16), got {g.numel()}")
-        self.state.push(v, g)
+            # 融合得到 memory token m_t
+            m = self.fm(torch.cat([vv, oo], dim=-1))  # (300,)
 
-    def forward(self) -> torch.Tensor:
-        v_stack, g_stack = self.state.padded_stacks(self.device)  # (T,2048), (T,256)
-        return self.core.fuse_tokens(v_stack, g_stack)            # (T,300)
+            out.append(m)
+
+        # 如果 memory 长度不足 T，在前面补零
+        if len(out) < T:
+            pad = [
+                torch.zeros(300, device=self.device)
+                for _ in range(T - len(out))
+            ]
+            out = pad + out
+
+        # 返回 shape = (T, 300)
+        return torch.stack(out, dim=0)

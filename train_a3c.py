@@ -42,49 +42,22 @@ from envs.thor_objnav_env import ThorObjNavEnv
 
 
 # ---------------------------
-# Shared RMSprop (Hogwild) — paper-aligned
+# Shared Adam (Hogwild)
 # ---------------------------
-class SharedRMSprop(torch.optim.RMSprop):
-    """RMSprop optimizer whose state tensors are placed in shared memory (A3C classic).
+class SharedAdam(torch.optim.Adam):
+    """Adam optimizer whose state tensors are placed in shared memory (A3C classic)."""
 
-    Paper alignment (Appendix A - Implementation Details):
-      - Optimizer: RMSprop
-      - LR: 7e-4 linearly decayed to 0 over training
-    """
-
-    def __init__(
-        self,
-        params,
-        lr: float = 7e-4,
-        alpha: float = 0.99,
-        eps: float = 1e-5,
-        weight_decay: float = 0.0,
-        momentum: float = 0.0,
-        centered: bool = False,
-    ):
-        super().__init__(
-            params,
-            lr=lr,
-            alpha=alpha,
-            eps=eps,
-            weight_decay=weight_decay,
-            momentum=momentum,
-            centered=centered,
-        )
-        # Place optimizer state in shared memory for Hogwild updates
+    def __init__(self, params, lr=1e-4, betas=(0.9, 0.999), eps=1e-8, weight_decay=0):
+        super().__init__(params, lr=lr, betas=betas, eps=eps, weight_decay=weight_decay)
         for group in self.param_groups:
             for p in group["params"]:
                 state = self.state[p]
                 state["step"] = torch.zeros(1)
-                state["square_avg"] = torch.zeros_like(p.data)
+                state["exp_avg"] = torch.zeros_like(p.data)
+                state["exp_avg_sq"] = torch.zeros_like(p.data)
                 state["step"].share_memory_()
-                state["square_avg"].share_memory_()
-                if momentum != 0.0:
-                    state["momentum_buffer"] = torch.zeros_like(p.data)
-                    state["momentum_buffer"].share_memory_()
-                if centered:
-                    state["grad_avg"] = torch.zeros_like(p.data)
-                    state["grad_avg"].share_memory_()
+                state["exp_avg"].share_memory_()
+                state["exp_avg_sq"].share_memory_()
 
 
 # ---------------------------
@@ -96,87 +69,25 @@ def set_global_seeds(seed: int):
     torch.cuda.manual_seed_all(seed)
 
 
-def choose_scenes_and_targets(smalltest: bool):
+def choose_scenes_and_targets(smalltest: bool) -> Tuple[List[str], Dict[str, List[str]]]:
     # NOTE: smalltest is for debugging only.
     if smalltest:
         scenes = [f"FloorPlan{i}" for i in range(1, 21)]
         targets_by_room = {"Kitchen": ["GarbageCan"]}
         return scenes, targets_by_room
 
-    # ===== Paper-aligned setting =====
-    scenes = (
-        [f"FloorPlan{i}" for i in range(1, 21)] +
-        [f"FloorPlan{200+i}" for i in range(1, 21)] +
-        [f"FloorPlan{300+i}" for i in range(1, 21)] +
-        [f"FloorPlan{400+i}" for i in range(1, 21)]
-    )
-
+    scenes = [f"FloorPlan{i}" for i in range(1, 31)] + \
+             [f"FloorPlan{200+i}" for i in range(1, 31)] + \
+             [f"FloorPlan{300+i}" for i in range(1, 31)] + \
+             [f"FloorPlan{400+i}" for i in range(1, 31)]
     targets_by_room = {
-        "Kitchen": [
-            "Toaster",
-            "Microwave",
-            "Fridge",
-            "CoffeeMachine",
-            "GarbageCan",
-            "Bowl",
-        ],
-        "LivingRoom": [
-            "Pillow",
-            "Laptop",
-            "Television",
-            "GarbageCan",
-            "Bowl",
-        ],
-        "Bedroom": [
-            "HousePlant",
-            "Lamp",
-            "Book",
-            "AlarmClock",
-        ],
-        "Bathroom": [
-            "Sink",
-            "ToiletPaper",
-            "SoapBottle",
-            "LightSwitch",
-        ],
+        "Kitchen": ["GarbageCan", "Mug", "Apple", "Bowl"],
+        "LivingRoom": ["RemoteControl", "Laptop", "Book"],
+        "Bedroom": ["Pillow", "AlarmClock", "TeddyBear"],
+        "Bathroom": ["SoapBottle", "ToiletPaper", "Towel"],
     }
     return scenes, targets_by_room
 
-def assert_targets_in_w2v_table(
-    targets_by_room: Dict[str, List[str]],
-    w2v_tokens: List[str],
-    *,
-    smalltest: bool = False,
-):
-    """
-    Abort training if any target objectType is missing from the W2V table.
-
-    This prevents silent OOV -> zero-vector failures and ensures
-    strict paper-aligned semantics.
-    """
-    if smalltest:
-        # smalltest is for debugging only; do not enforce paper vocab
-        return
-
-    token_set = set(str(t) for t in w2v_tokens)
-
-    missing = []
-    for room, targets in targets_by_room.items():
-        for t in targets:
-            if t not in token_set:
-                missing.append((room, t))
-
-    if missing:
-        lines = [
-            "[FATAL] Paper target(s) missing from W2V table:",
-        ]
-        for room, t in missing:
-            lines.append(f"  - {room}: {t}")
-        lines.append("")
-        lines.append("You must regenerate the W2V table with paper targets included.")
-        lines.append("Hint:")
-        lines.append("  python get_all_w2v.py --include-targets ...")
-        raise RuntimeError("\n".join(lines))
 
 def load_w2v_table(table_path: str) -> Tuple[List[str], np.ndarray]:
     """Load w2v tokens/vectors from .npz created earlier."""
@@ -244,22 +155,14 @@ def preprocess_obs(obs: Dict[str, Any]) -> Tuple[torch.Tensor, torch.Tensor, tor
 
 
 def ensure_shared_grads(local_model: nn.Module, shared_model: nn.Module):
-    """Copy local gradients to shared model parameters.
-
-    Important when local_model runs on CUDA but shared_model stays on CPU (classic A3C):
-    we must move grads to CPU before assigning to shared params, otherwise the
-    optimizer step can hang / behave unpredictably.
-    """
+    """Copy local gradients to shared model parameters."""
     for lp, sp in zip(local_model.parameters(), shared_model.parameters()):
         if lp.grad is None:
             continue
-        g = lp.grad.detach()
-        if g.is_cuda:
-            g = g.cpu()
         if sp.grad is None:
-            sp.grad = g.clone()
+            sp.grad = lp.grad.detach().clone()
         else:
-            sp.grad.copy_(g)
+            sp.grad.copy_(lp.grad)
 
 
 # ---------------------------
@@ -373,7 +276,7 @@ def worker_loop(
     rank: int,
     args,
     shared_model: A3CObjNavNet,
-    optimizer: SharedRMSprop,
+    optimizer: SharedAdam,
     global_step: mp.Value,
     opt_lock: mp.Lock,
     stats_q,
@@ -397,11 +300,8 @@ def worker_loop(
             scenes=scenes,
             targets_by_room=targets_by_room,
             embed=args.embed,
-            # Env should stay on CPU; using CUDA here can create extra GPU contexts per worker
-            # and interact badly with Unity rendering.
-            device="cpu",
+            device=args.device,
             debug=args.debug,
-            headless=bool(getattr(args, "headless", False)),
         )
 
         local_model = A3CObjNavNet(
@@ -414,6 +314,7 @@ def worker_loop(
         )
         local_model.load_state_dict(shared_model.state_dict())
         local_model.train()
+        ready_q.put(("init_done", rank, pid, time.time()))
 
         cfg = WorkerCfg(
             gamma=args.gamma,
@@ -473,8 +374,6 @@ def worker_loop(
                     stats_q.put(("steps", rank, args.report_every, time.time()))
                 if (time.time() - last_hb) >= args.heartbeat_sec:
                     stats_q.put(("hb", rank, local_steps, time.time()))
-                    if bool(getattr(args, "debug_workers", False)):
-                        print(f"[ALIVE] worker{rank} pid={os.getpid()} step={local_steps}", flush=True)
                     last_hb = time.time()
 
                 if done:
@@ -541,13 +440,6 @@ def worker_loop(
 
             with opt_lock:
                 ensure_shared_grads(local_model, shared_model)
-                # Paper: lr starts at args.lr (7e-4) and linearly decays to 0 over training
-                with global_step.get_lock():
-                    gs_now = int(global_step.value)
-                frac = max(0.0, 1.0 - (gs_now / float(max(1, args.total_frames))))
-                lr_now = float(args.lr) * frac
-                for pg in optimizer.param_groups:
-                    pg["lr"] = lr_now
                 optimizer.step()
 
         env.close()
@@ -575,20 +467,10 @@ def main():
     parser.add_argument("--value-coef", type=float, default=0.5)
     parser.add_argument("--entropy-coef", type=float, default=0.01)
     parser.add_argument("--max-grad-norm", type=float, default=40.0)
-    parser.add_argument("--lr", type=float, default=7e-4)
-    parser.add_argument("--rmsprop-alpha", type=float, default=0.99)
-    parser.add_argument("--rmsprop-eps", type=float, default=1e-5)
-    parser.add_argument("--rmsprop-momentum", type=float, default=0.0)
-    parser.add_argument("--rmsprop-centered", action="store_true")
+    parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--device", type=str, default="cpu")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--debug", action="store_true")
-    parser.add_argument("--debug-workers", action="store_true", help="Print per-worker ALIVE heartbeats and enable deadlock watchdog in main.")
-    parser.add_argument(
-        "--headless",
-        action="store_true",
-        help="Run ALL AI2-THOR controllers in headless off-screen mode (platform=CloudRendering).",
-    )
     parser.add_argument("--report-every", type=int, default=50)
     parser.add_argument("--heartbeat-sec", type=float, default=5.0)
     parser.add_argument("--init-timeout-sec", type=float, default=20.0)
@@ -604,12 +486,6 @@ def main():
     args.goal_vocab = goal_vocab  # pass to workers via args (picklable)
 
     w2v_tokens, w2v_vecs = load_w2v_table(args.w2v_table)
-    assert_targets_in_w2v_table(targets_by_room, w2v_tokens, smalltest=args.smalltest,)# 论文目标必须在 w2v table 中
-    print(
-    f"[OK] W2V table loaded and verified: {args.w2v_table} "
-    f"(tokens={len(w2v_tokens)})",
-    flush=True,
-    )
     goal_w2v_weight = build_goal_w2v_embedding(goal_vocab, w2v_tokens, w2v_vecs)
     args.goal_w2v_weight = goal_w2v_weight  # torch tensor is picklable under spawn
 
@@ -627,7 +503,7 @@ def main():
     )
     shared_model.share_memory()
 
-    optimizer = SharedRMSprop(shared_model.parameters(), lr=args.lr, alpha=args.rmsprop_alpha, eps=args.rmsprop_eps, momentum=args.rmsprop_momentum, centered=bool(args.rmsprop_centered))
+    optimizer = SharedAdam(shared_model.parameters(), lr=args.lr)
 
     global_step = mp.Value("i", 0, lock=True)
     opt_lock = mp.Lock()
@@ -677,7 +553,6 @@ def main():
         csv_path = os.path.join(log_dir, "train_log.csv")
         csv_fields = [
             "global_step",
-            "lr",
             "episode_index",
             "episode_return",
             "episode_len",
@@ -716,8 +591,6 @@ def main():
                 elif tag == "episode":
                     # val is a dict of episode metrics from worker
                     data = dict(val)
-                    lr_now = optimizer.param_groups[0]["lr"]
-                    data["lr"] = float(f"{lr_now:.8f}")
                     csv_w.writerow({k: data.get(k, "") for k in csv_fields})
                     csv_f.flush()
 
@@ -758,7 +631,7 @@ def main():
                     print("[A3C] workers exited:", [(p.pid, p.exitcode) for p in dead], flush=True)
                     raise SystemExit(1)
 
-                if bool(getattr(args, "debug_workers", False)) and (now - last_msg) > max(10.0, float(args.heartbeat_sec) * 3) and total_steps == 0:
+                if (now - last_msg) > max(10.0, float(args.heartbeat_sec) * 3) and total_steps == 0:
                     print("[A3C][DBG] no progress/no messages; possible init hang or deadlock", flush=True)
                     for i, p in enumerate(procs):
                         print(f"  worker{i} alive={p.is_alive()} exitcode={p.exitcode}", flush=True)
@@ -784,7 +657,7 @@ def main():
             pass
 
         os.makedirs("runs_a3c", exist_ok=True)
-        ckpt = os.path.join("runs_a3c", "model.pt")
+        ckpt = os.path.join("runs_a3c", "a3c_osm_omt_threads.pt")
         torch.save({"model": shared_model.state_dict(), "args": vars(args), "goal_vocab": goal_vocab}, ckpt)
         print(f"[A3C] saved checkpoint: {ckpt}", flush=True)
 
